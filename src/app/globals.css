@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+:root {
+  --background: #07111f;
+  --foreground: #e5eefb;
+}
+
+body {
+  background: radial-gradient(circle at top left, #172554 0, #07111f 36rem), var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+button, input, textarea { font: inherit; }
+
+@layer components {
+  .card { @apply rounded-2xl border border-white/10 bg-slate-950/70 p-5 shadow-2xl shadow-black/20 backdrop-blur; }
+  .input { @apply w-full rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-white outline-none placeholder:text-slate-500 focus:border-cyan-300; }
+  .btn-primary { @apply rounded-xl bg-cyan-300 px-4 py-2 font-semibold text-slate-950 transition hover:bg-cyan-200 disabled:cursor-not-allowed disabled:opacity-50; }
+  .btn-secondary { @apply rounded-xl border border-white/10 bg-white/5 px-4 py-2 font-semibold text-white transition hover:bg-white/10; }
+}
