@@ -1,0 +1,48 @@
+# Version control
+.git
+.gitignore
+
+# Dependencies
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Next.js build/cache output
+.next
+out
+build
+dist
+
+# Docker/local deployment files that should not be copied into images
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Local environment files / secrets
+.env
+.env*.local
+!.env.example
+
+# Logs and runtime files
+logs
+*.log
+*.pid
+*.seed
+*.pid.lock
+
+# Tests/coverage/cache
+coverage
+.nyc_output
+.cache
+.eslintcache
+*.tsbuildinfo
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode
+.idea
+*.swp
+*.swo
