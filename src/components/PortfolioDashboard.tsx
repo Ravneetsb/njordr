@@ -1,8 +1,9 @@
 "use client";
 
 import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import type { AppSettings, BucketType, Holding, HoldingBucketRow, HoldingInput, StockQuote, Transaction, TransactionInput } from "@/lib/types";
+import type { AppSettings, BucketType, Holding, HoldingBucketRow, HoldingInput, StockQuote, TargetMode, Transaction, TransactionInput, TransactionType } from "@/lib/types";
 import { buildBucketRows, currency, maxInvestmentValue, numberFmt, percentFmt } from "@/lib/risk";
+import { Icon, MiniMetric, Modal, PositionsWorkspace, SummaryCard, TransactionHistory, type HoldingCardView } from "./SignalWorkspace";
 import { portfolioRepository } from "@/lib/repositories/portfolioRepository";
 import { fetchQuotes, isQuoteFresh } from "@/lib/quotes";
 
@@ -11,8 +12,9 @@ const today = () => new Date().toISOString().slice(0, 10);
 const emptyTransactionForm = (symbol = "", bucket: BucketType = "short_term"): TransactionInput => ({
   symbol,
   bucket,
+  type: "buy",
   quantity: 0,
-  buyPrice: 0,
+  price: 0,
   tradeDate: today(),
   notes: "",
 });
@@ -29,7 +31,9 @@ type RiskModalState = {
   maxRiskAmount: number;
   riskPercent: number;
   targetEnabled: boolean;
+  targetMode: TargetMode;
   targetProfitPercent: number;
+  targetPrice: number;
   notes: string;
 };
 
@@ -43,20 +47,6 @@ type PlanModalState = {
   isFetchingQuote: boolean;
 };
 
-type HoldingCardView = {
-  holding: Holding;
-  quote?: StockQuote;
-  longTerm: HoldingBucketRow;
-  shortTerm: HoldingBucketRow;
-  transactions: Transaction[];
-  totals: {
-    quantity: number;
-    value?: number;
-    costBasis?: number;
-    unrealizedGain?: number;
-    unrealizedGainPercent?: number;
-  };
-};
 
 export function PortfolioDashboard() {
   const [holdings, setHoldings] = useState<Holding[]>([]);
@@ -66,7 +56,9 @@ export function PortfolioDashboard() {
   const [transactionModal, setTransactionModal] = useState<TransactionModalState>({ open: false, form: emptyTransactionForm() });
   const [riskModal, setRiskModal] = useState<RiskModalState | null>(null);
   const [planModal, setPlanModal] = useState<PlanModalState | null>(null);
-  const [expandedTransactions, setExpandedTransactions] = useState<string | null>(null);
+  const [view, setView] = useState<"portfolio" | "transactions" | "settings">("portfolio");
+  const [isLoading, setIsLoading] = useState(true);
+  const [loadFailed, setLoadFailed] = useState(false);
   const [message, setMessage] = useState<string>("");
   const [isRefreshing, setIsRefreshing] = useState(false);
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -100,16 +92,25 @@ export function PortfolioDashboard() {
   const lastRefreshText = summary.lastRefreshAt ? new Date(summary.lastRefreshAt).toLocaleTimeString() : "—";
 
   async function loadInitialData() {
-    const [savedHoldings, savedTransactions, savedSettings] = await Promise.all([
-      portfolioRepository.getHoldings(),
-      portfolioRepository.getTransactions(),
-      portfolioRepository.getSettings(),
-    ]);
-    setHoldings(savedHoldings);
-    setTransactions(savedTransactions);
-    setSettings(savedSettings);
-    const symbols = Array.from(new Set([...savedHoldings.map((h) => h.symbol), ...savedTransactions.map((t) => t.symbol)]));
-    setQuotes(await portfolioRepository.getCachedQuotes(symbols));
+    setIsLoading(true);
+    setLoadFailed(false);
+    try {
+      const [savedHoldings, savedTransactions, savedSettings] = await Promise.all([
+        portfolioRepository.getHoldings(),
+        portfolioRepository.getTransactions(),
+        portfolioRepository.getSettings(),
+      ]);
+      setHoldings(savedHoldings);
+      setTransactions(savedTransactions);
+      setSettings(savedSettings);
+      const symbols = Array.from(new Set([...savedHoldings.map((h) => h.symbol), ...savedTransactions.map((t) => t.symbol)]));
+      setQuotes(await portfolioRepository.getCachedQuotes(symbols));
+    } catch (error) {
+      setLoadFailed(true);
+      setMessage(error instanceof Error ? error.message : "Could not load your portfolio.");
+    } finally {
+      setIsLoading(false);
+    }
   }
 
   async function reloadPortfolioData() {
@@ -143,6 +144,7 @@ export function PortfolioDashboard() {
   }
 
   function openTransactionModal(symbol = "", bucket: BucketType = "short_term") {
+    setMessage("");
     setTransactionModal({ open: true, form: emptyTransactionForm(symbol, bucket) });
   }
 
@@ -151,6 +153,7 @@ export function PortfolioDashboard() {
   }
 
   function openPlanModal(symbol = "", bucket: BucketType = "short_term") {
+    setMessage("");
     const existing = holdings.find((holding) => holding.symbol === symbol.toUpperCase());
     const isLongTerm = bucket === "long_term";
     setPlanModal({
@@ -195,22 +198,34 @@ export function PortfolioDashboard() {
       longTermQuantity: existing.longTermQuantity,
       longTermMaxRiskAmount: isLongTerm ? planModal.maxRiskAmount : existing.longTermMaxRiskAmount,
       longTermRiskPercent: isLongTerm ? planModal.riskPercent : existing.longTermRiskPercent,
+      longTermTargetEnabled: existing.longTermTargetEnabled,
+      longTermTargetMode: existing.longTermTargetMode,
       longTermTargetProfitPercent: existing.longTermTargetProfitPercent ?? 0,
+      longTermTargetPrice: existing.longTermTargetPrice ?? 0,
       shortTermQuantity: existing.shortTermQuantity,
       shortTermMaxRiskAmount: !isLongTerm ? planModal.maxRiskAmount : existing.shortTermMaxRiskAmount,
       shortTermRiskPercent: !isLongTerm ? planModal.riskPercent : existing.shortTermRiskPercent,
+      shortTermTargetEnabled: existing.shortTermTargetEnabled,
+      shortTermTargetMode: existing.shortTermTargetMode,
       shortTermTargetProfitPercent: existing.shortTermTargetProfitPercent ?? 0,
+      shortTermTargetPrice: existing.shortTermTargetPrice ?? 0,
     } : {
       symbol,
       notes: "Planning-only risk record. Add transactions when you buy.",
       longTermQuantity: 0,
       longTermMaxRiskAmount: isLongTerm ? planModal.maxRiskAmount : 0,
       longTermRiskPercent: isLongTerm ? planModal.riskPercent : 0,
+      longTermTargetEnabled: false,
+      longTermTargetMode: "percent",
       longTermTargetProfitPercent: 0,
+      longTermTargetPrice: 0,
       shortTermQuantity: 0,
       shortTermMaxRiskAmount: !isLongTerm ? planModal.maxRiskAmount : 0,
       shortTermRiskPercent: !isLongTerm ? planModal.riskPercent : 0,
+      shortTermTargetEnabled: false,
+      shortTermTargetMode: "percent",
       shortTermTargetProfitPercent: 0,
+      shortTermTargetPrice: 0,
     };
 
     try {
@@ -244,18 +259,24 @@ export function PortfolioDashboard() {
   }
 
   function openRiskModal(holding: Holding, bucket: BucketType) {
+    setMessage("");
     const isLongTerm = bucket === "long_term";
     const maxRiskAmount = isLongTerm ? holding.longTermMaxRiskAmount : holding.shortTermMaxRiskAmount;
     const riskPercent = isLongTerm ? holding.longTermRiskPercent : holding.shortTermRiskPercent;
     const targetProfitPercent = isLongTerm ? holding.longTermTargetProfitPercent ?? 0 : holding.shortTermTargetProfitPercent ?? 0;
+    const targetPrice = isLongTerm ? holding.longTermTargetPrice ?? 0 : holding.shortTermTargetPrice ?? 0;
+    const targetMode = isLongTerm ? holding.longTermTargetMode ?? "percent" : holding.shortTermTargetMode ?? "percent";
+    const storedTargetEnabled = isLongTerm ? holding.longTermTargetEnabled : holding.shortTermTargetEnabled;
     setRiskModal({
       holding,
       bucket,
       riskEnabled: maxRiskAmount > 0 && riskPercent > 0,
       maxRiskAmount,
       riskPercent,
-      targetEnabled: targetProfitPercent > 0,
+      targetEnabled: storedTargetEnabled ?? targetProfitPercent > 0,
+      targetMode,
       targetProfitPercent,
+      targetPrice,
       notes: holding.notes ?? "",
     });
   }
@@ -273,11 +294,17 @@ export function PortfolioDashboard() {
       longTermQuantity: riskModal.holding.longTermQuantity,
       longTermMaxRiskAmount: isLongTerm ? (riskModal.riskEnabled ? riskModal.maxRiskAmount : 0) : riskModal.holding.longTermMaxRiskAmount,
       longTermRiskPercent: isLongTerm ? (riskModal.riskEnabled ? riskModal.riskPercent : 0) : riskModal.holding.longTermRiskPercent,
-      longTermTargetProfitPercent: isLongTerm ? (riskModal.targetEnabled ? riskModal.targetProfitPercent : 0) : riskModal.holding.longTermTargetProfitPercent ?? 0,
+      longTermTargetEnabled: isLongTerm ? riskModal.targetEnabled : riskModal.holding.longTermTargetEnabled,
+      longTermTargetMode: isLongTerm ? riskModal.targetMode : riskModal.holding.longTermTargetMode,
+      longTermTargetProfitPercent: isLongTerm ? riskModal.targetProfitPercent : riskModal.holding.longTermTargetProfitPercent ?? 0,
+      longTermTargetPrice: isLongTerm ? riskModal.targetPrice : riskModal.holding.longTermTargetPrice ?? 0,
       shortTermQuantity: riskModal.holding.shortTermQuantity,
       shortTermMaxRiskAmount: !isLongTerm ? (riskModal.riskEnabled ? riskModal.maxRiskAmount : 0) : riskModal.holding.shortTermMaxRiskAmount,
       shortTermRiskPercent: !isLongTerm ? (riskModal.riskEnabled ? riskModal.riskPercent : 0) : riskModal.holding.shortTermRiskPercent,
-      shortTermTargetProfitPercent: !isLongTerm ? (riskModal.targetEnabled ? riskModal.targetProfitPercent : 0) : riskModal.holding.shortTermTargetProfitPercent ?? 0,
+      shortTermTargetEnabled: !isLongTerm ? riskModal.targetEnabled : riskModal.holding.shortTermTargetEnabled,
+      shortTermTargetMode: !isLongTerm ? riskModal.targetMode : riskModal.holding.shortTermTargetMode,
+      shortTermTargetProfitPercent: !isLongTerm ? riskModal.targetProfitPercent : riskModal.holding.shortTermTargetProfitPercent ?? 0,
+      shortTermTargetPrice: !isLongTerm ? riskModal.targetPrice : riskModal.holding.shortTermTargetPrice ?? 0,
     };
 
     try {
@@ -293,31 +320,51 @@ export function PortfolioDashboard() {
   async function deleteHolding(id: string) {
     const holding = holdings.find((h) => h.id === id);
     if (!holding || !window.confirm("Delete " + holding.symbol + " and all transactions for it?")) return;
-    await portfolioRepository.deleteHolding(id);
-    await reloadPortfolioData();
-    setMessage(holding.symbol + " deleted.");
+    try {
+      await portfolioRepository.deleteHolding(id);
+      await reloadPortfolioData();
+      setMessage(holding.symbol + " deleted.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not delete holding.");
+    }
   }
 
   async function deleteTransaction(id: string) {
     const transaction = transactions.find((t) => t.id === id);
     if (!transaction || !window.confirm("Delete " + transaction.symbol + " " + bucketLabel(transaction.bucket) + " transaction?")) return;
-    await portfolioRepository.deleteTransaction(id);
-    await reloadPortfolioData();
-    setMessage("Transaction deleted. Quantity, P&L, and risk were re-evaluated.");
+    try {
+      await portfolioRepository.deleteTransaction(id);
+      await reloadPortfolioData();
+      setMessage("Transaction deleted. Quantity, P&L, and risk were re-evaluated.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not delete transaction.");
+    }
   }
 
   async function updateAutoRefresh(enabled: boolean) {
-    setSettings(await portfolioRepository.updateSettings({ ...settings, autoRefreshEnabled: enabled, refreshIntervalSeconds: 60 }));
+    const previous = settings;
+    const next = { ...settings, autoRefreshEnabled: enabled, refreshIntervalSeconds: 60 };
+    setSettings(next);
+    try {
+      await portfolioRepository.updateSettings(next);
+    } catch (error) {
+      setSettings(previous);
+      setMessage(error instanceof Error ? error.message : "Could not save preferences.");
+    }
   }
 
   async function exportBackup() {
-    const backup = await portfolioRepository.exportBackup();
-    const url = URL.createObjectURL(new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" }));
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = "njordr-backup-" + today() + ".json";
-    anchor.click();
-    URL.revokeObjectURL(url);
+    try {
+      const backup = await portfolioRepository.exportBackup();
+      const url = URL.createObjectURL(new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" }));
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = "njordr-backup-" + today() + ".json";
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not export portfolio.");
+    }
   }
 
   async function importBackup(event: ChangeEvent<HTMLInputElement>) {
@@ -336,72 +383,46 @@ export function PortfolioDashboard() {
   }
 
   return (
-    <main className="min-h-screen px-4 py-8 sm:px-6 lg:px-8">
-      <div className="mx-auto max-w-7xl space-y-8">
-        <header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-          <div>
-            <p className="text-sm font-semibold uppercase tracking-[0.3em] text-cyan-300">Njordr</p>
-            <h1 className="mt-2 text-4xl font-bold text-white">Stock Risk Assessment</h1>
-            <p className="mt-2 max-w-2xl text-slate-300">Add buys first. Njordr calculates quantity, average cost, P&L, risk, and target status per long-term and short-term bucket.</p>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <button className="btn-primary" onClick={() => openTransactionModal()}>+ Add transaction</button>
-            <button className="btn-secondary" onClick={() => openPlanModal()}>Plan purchase</button>
-            <button className="btn-secondary" onClick={() => void refreshQuotes(true)} disabled={isRefreshing || holdings.length === 0}>{isRefreshing ? "Refreshing…" : "Refresh prices"}</button>
-            <button className="btn-secondary" onClick={exportBackup}>Export JSON</button>
-            <button className="btn-secondary" onClick={() => fileRef.current?.click()}>Import JSON</button>
-            <input ref={fileRef} type="file" accept="application/json" className="hidden" onChange={(event) => void importBackup(event)} />
-          </div>
+    <div className="signal-app">
+      <aside className="sidebar">
+        <a className="wordmark" href="#main" aria-label="Njordr home"><span className="brand-mark">N</span>NJORDR<span className="brand-dot">.</span></a>
+        <div className="nav-label">WORKSPACE</div>
+        <nav aria-label="Main navigation">
+          <button aria-current={view === "portfolio" ? "page" : undefined} onClick={() => setView("portfolio")}><Icon name="portfolio" />Portfolio<span className="nav-count">{holdings.length.toString().padStart(2, "0")}</span></button>
+          <button aria-current={view === "transactions" ? "page" : undefined} onClick={() => setView("transactions")}><Icon name="transactions" />Transactions</button>
+          <button onClick={() => openPlanModal()}><Icon name="planner" />Planner<small>↗</small></button>
+          <button aria-current={view === "settings" ? "page" : undefined} onClick={() => setView("settings")}><Icon name="settings" />Settings</button>
+        </nav>
+        <div className="sidebar-bottom"><span className="local-dot" />Local workspace<span className="edition">SIGNAL / 01</span></div>
+      </aside>
+      <main id="main" className="workspace">
+        <header className="workspace-header">
+          <div><p className="eyebrow">PERSONAL INVESTING / {view === "portfolio" ? "OVERVIEW" : view.toUpperCase()}</p><h1>{view === "portfolio" ? "Portfolio" : view === "transactions" ? "Transactions" : "Settings"}<span className="heading-dot">.</span></h1></div>
+          <div className="header-actions"><button className="btn-secondary" onClick={() => openPlanModal()}><Icon name="planner" />Plan purchase</button><button className="btn-primary" onClick={() => openTransactionModal()}><Icon name="plus" />Add transaction</button></div>
         </header>
-
-        {message ? <div className="rounded-xl border border-cyan-400/30 bg-cyan-400/10 px-4 py-3 text-sm text-cyan-100">{message}</div> : null}
-
-        <section className="grid gap-4 md:grid-cols-3 lg:grid-cols-7">
-          <SummaryCard label="Portfolio" value={currency(summary.totalValue)} />
-          <SummaryCard label="Cost basis" value={currency(summary.totalCostBasis)} />
-          <SummaryCard label="Unrealized P&L" value={currency(summary.totalUnrealizedGain)} danger={summary.totalUnrealizedGain < 0} good={summary.totalUnrealizedGain > 0} />
-          <SummaryCard label="Transactions" value={String(transactions.length)} />
-          <SummaryCard label="Over-limit" value={String(summary.overLimitCount)} danger={summary.overLimitCount > 0} />
-          <SummaryCard label="Targets hit" value={String(summary.targetReachedCount)} good={summary.targetReachedCount > 0} />
-          <SummaryCard label="Last refresh" value={lastRefreshText} />
-        </section>
-
-        <section className="card">
-          <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <h2 className="text-xl font-semibold text-white">Portfolio</h2>
-              <p className="text-sm text-slate-300">One card per stock. Use bucket actions for transactions, risk rules, and profit targets.</p>
-            </div>
-            <label className="flex items-center gap-3 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-200">
-              <input type="checkbox" checked={settings.autoRefreshEnabled} onChange={(e) => void updateAutoRefresh(e.target.checked)} />
-              Auto-refresh every 60s
-            </label>
-          </div>
-
-          {cards.length === 0 ? (
-            <EmptyState onAdd={() => openTransactionModal()} />
-          ) : (
-            <div className="grid gap-4 xl:grid-cols-2">
-              {cards.map((card) => (
-                <StockCard
-                  key={card.holding.id}
-                  card={card}
-                  expandedTransactions={expandedTransactions === card.holding.id}
-                  onToggleTransactions={() => setExpandedTransactions(expandedTransactions === card.holding.id ? null : card.holding.id)}
-                  onAddTransaction={(bucket) => openTransactionModal(card.holding.symbol, bucket)}
-                  onPlanPurchase={(bucket) => openPlanModal(card.holding.symbol, bucket)}
-                  onEditRisk={(bucket) => openRiskModal(card.holding, bucket)}
-                  onDeleteHolding={() => void deleteHolding(card.holding.id)}
-                  onDeleteTransaction={(id) => void deleteTransaction(id)}
-                />
-              ))}
-            </div>
-          )}
-        </section>
-      </div>
+        {message && !planModal && !riskModal && !transactionModal.open ? <div className="notice" role="status">{message}<button aria-label="Dismiss notification" onClick={() => setMessage("")}>×</button></div> : null}
+        <input ref={fileRef} type="file" accept="application/json" className="hidden" aria-label="Import backup" onChange={(event) => void importBackup(event)} />
+        {isLoading ? <div className="empty-state" role="status"><span className="eyebrow">OPENING WORKSPACE</span><h2>Loading your portfolio…</h2></div> : loadFailed ? <div className="empty-state"><h2>Unable to open your portfolio</h2><button className="btn-primary" onClick={() => void loadInitialData()}>Try again</button></div> : <>
+          {view === "portfolio" ? <>
+            <section className="summary-strip" aria-label="Portfolio summary">
+              <SummaryCard label="Portfolio value" value={currency(summary.totalValue)} />
+              <SummaryCard label="Cost basis" value={currency(summary.totalCostBasis)} />
+              <SummaryCard label="Unrealized P&L" value={currency(summary.totalUnrealizedGain)} danger={summary.totalUnrealizedGain !== undefined && summary.totalUnrealizedGain < 0} good={summary.totalUnrealizedGain !== undefined && summary.totalUnrealizedGain > 0} />
+              <SummaryCard label="Realized P&L" value={currency(summary.totalRealizedGain)} danger={summary.totalRealizedGain !== undefined && summary.totalRealizedGain < 0} good={summary.totalRealizedGain !== undefined && summary.totalRealizedGain > 0} />
+              <SummaryCard label="Buckets over limit" value={String(summary.overLimitCount).padStart(2, "0")} danger={summary.overLimitCount > 0} />
+              <SummaryCard label="Targets hit" value={String(summary.targetReachedCount).padStart(2, "0")} good={summary.targetReachedCount > 0} />
+            </section>
+            <PositionsWorkspace cards={cards} onAdd={openTransactionModal} onPlan={openPlanModal} onRisk={openRiskModal} onDeleteHolding={(id) => void deleteHolding(id)} onDeleteTransaction={(id) => void deleteTransaction(id)} />
+          </> : view === "transactions" ? <section className="page-section"><div className="section-heading"><h2>Transaction history <span className="count">{transactions.length}</span></h2><span className="eyebrow">MOST RECENT FIRST</span></div><TransactionHistory transactions={transactions} rows={rows} onDelete={(id) => void deleteTransaction(id)} /></section> : <section className="settings-page">
+            <div className="settings-section"><div><span className="eyebrow">01 / MARKET DATA</span><h2>Quote preferences</h2><p className="muted">Refresh prices while your workspace is visible.</p></div><div><label className="switch-label"><input type="checkbox" checked={settings.autoRefreshEnabled} onChange={(e) => void updateAutoRefresh(e.target.checked)} /><span>Auto-refresh every 60 seconds</span></label><button className="btn-secondary" disabled={isRefreshing || !holdings.length} onClick={() => void refreshQuotes(true)}>{isRefreshing ? "Refreshing…" : "Refresh prices now"}</button></div></div>
+            <div className="settings-section"><div><span className="eyebrow">02 / YOUR DATA</span><h2>Portfolio backup</h2><p className="muted">Save a copy of your holdings, transactions, and preferences.</p></div><div className="space-y-4"><div className="header-actions"><button className="btn-secondary" onClick={() => void exportBackup()}>Export JSON</button><button className="btn-secondary" onClick={() => fileRef.current?.click()}>Import JSON</button></div><p className="muted">Import replaces your current portfolio after confirmation.</p></div></div>
+          </section>}
+        </>}
+        {!isLoading ? <footer className="status-bar"><button className="refresh-button" disabled={isRefreshing || !holdings.length} onClick={() => void refreshQuotes(true)}><Icon name="refresh" />{isRefreshing ? "Refreshing prices…" : "Refresh prices"}</button><span>Last refreshed <strong>{lastRefreshText}</strong></span><label className="switch-label"><input type="checkbox" checked={settings.autoRefreshEnabled} onChange={(e) => void updateAutoRefresh(e.target.checked)} />Auto-refresh <span className="muted">/ 60s</span></label><span className="status-caption">LOCAL STORAGE · USD</span></footer> : null}
+      </main>
 
       {planModal ? (
-        <Modal title="Plan purchase" onClose={() => setPlanModal(null)}>
+        <Modal message={message} title="Plan purchase" onClose={() => setPlanModal(null)}>
           <div className="space-y-4">
             <p className="text-sm text-slate-300">Use this before buying. Enter a risk amount, risk percent, and expected/current price to estimate max investment and share count. You can save it as risk settings without adding any transaction.</p>
             <div className="grid gap-4 sm:grid-cols-[1fr_auto]">
@@ -409,7 +430,7 @@ export function PortfolioDashboard() {
               <div className="flex items-end"><button className="btn-secondary h-10" type="button" onClick={() => void fetchPlanQuote()} disabled={planModal.isFetchingQuote}>{planModal.isFetchingQuote ? "Fetching…" : "Use live price"}</button></div>
             </div>
             <label className="block text-sm text-slate-200">Bucket
-              <select className="input mt-1" value={planModal.bucket} onChange={(e) => setPlanModal({ ...planModal, bucket: e.target.value as BucketType })}>
+              <select aria-label="Bucket" className="input mt-1" value={planModal.bucket} onChange={(e) => setPlanModal({ ...planModal, bucket: e.target.value as BucketType })}>
                 <option value="long_term">Long-term</option>
                 <option value="short_term">Short-term</option>
               </select>
@@ -430,24 +451,30 @@ export function PortfolioDashboard() {
       ) : null}
 
       {transactionModal.open ? (
-        <Modal title="Add transaction" onClose={closeTransactionModal}>
+        <Modal message={message} title="Add transaction" onClose={closeTransactionModal}>
           <form onSubmit={(event) => void submitTransaction(event)} className="space-y-4">
-            <p className="text-sm text-slate-300">This is the main workflow. Adding a buy updates quantity, average buy price, cost basis, P&L, and risk exposure automatically.</p>
+            <p className="text-sm text-slate-300">Buys add to a position. Sells reduce it using average-cost accounting and record realized P&L.</p>
             <Field label="Symbol" value={transactionModal.form.symbol} onChange={(value) => setTransactionModal({ ...transactionModal, form: { ...transactionModal.form, symbol: value.toUpperCase() } })} placeholder="AAPL" />
+            <label className="block text-sm text-slate-200">Transaction type
+              <select aria-label="Transaction type" className="input mt-1" value={transactionModal.form.type} onChange={(e) => setTransactionModal({ ...transactionModal, form: { ...transactionModal.form, type: e.target.value as TransactionType } })}>
+                <option value="buy">Buy</option>
+                <option value="sell">Sell</option>
+              </select>
+            </label>
             <label className="block text-sm text-slate-200">Bucket
-              <select className="input mt-1" value={transactionModal.form.bucket} onChange={(e) => setTransactionModal({ ...transactionModal, form: { ...transactionModal.form, bucket: e.target.value as BucketType } })}>
+              <select aria-label="Bucket" className="input mt-1" value={transactionModal.form.bucket} onChange={(e) => setTransactionModal({ ...transactionModal, form: { ...transactionModal.form, bucket: e.target.value as BucketType } })}>
                 <option value="long_term">Long-term</option>
                 <option value="short_term">Short-term</option>
               </select>
             </label>
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label="Quantity" type="number" min={0} step="any" value={transactionModal.form.quantity} onChange={(v) => setTransactionModal({ ...transactionModal, form: { ...transactionModal.form, quantity: Number(v) } })} />
-              <Field label="Buy price" type="number" min={0} step="any" value={transactionModal.form.buyPrice} onChange={(v) => setTransactionModal({ ...transactionModal, form: { ...transactionModal.form, buyPrice: Number(v) } })} />
+              <Field label={transactionModal.form.type === "sell" ? "Sell price" : "Buy price"} type="number" min={0} step="any" value={transactionModal.form.price} onChange={(v) => setTransactionModal({ ...transactionModal, form: { ...transactionModal.form, price: Number(v) } })} />
             </div>
             <Field label="Trade date" type="date" value={transactionModal.form.tradeDate} onChange={(v) => setTransactionModal({ ...transactionModal, form: { ...transactionModal.form, tradeDate: v } })} />
             <label className="block text-sm text-slate-200">Notes<textarea className="input mt-1 min-h-20" value={transactionModal.form.notes ?? ""} onChange={(e) => setTransactionModal({ ...transactionModal, form: { ...transactionModal.form, notes: e.target.value } })} placeholder="Optional transaction notes" /></label>
             <div className="flex gap-3">
-              <button className="btn-primary flex-1" type="submit">Add transaction</button>
+              <button className="btn-primary flex-1" type="submit">Add {transactionModal.form.type}</button>
               <button className="btn-secondary" type="button" onClick={closeTransactionModal}>Cancel</button>
             </div>
           </form>
@@ -455,7 +482,7 @@ export function PortfolioDashboard() {
       ) : null}
 
       {riskModal ? (
-        <Modal title={riskModal.holding.symbol + " " + bucketLabel(riskModal.bucket) + " settings"} onClose={() => setRiskModal(null)}>
+        <Modal message={message} title={riskModal.holding.symbol + " " + bucketLabel(riskModal.bucket) + " settings"} onClose={() => setRiskModal(null)}>
           <form onSubmit={(event) => void submitRiskSettings(event)} className="space-y-4">
             <p className="text-sm text-slate-300">Risk and target settings are optional and apply only to this bucket. Transactions remain separate.</p>
 
@@ -473,11 +500,21 @@ export function PortfolioDashboard() {
 
             <TogglePanel
               label="Enable target profit"
-              description="Show a target sell price based on average buy price and flag when the current price reaches it."
+              description="Set a fixed sell price or calculate one as a percentage above average buy price."
               checked={riskModal.targetEnabled}
               onChange={(checked) => setRiskModal({ ...riskModal, targetEnabled: checked })}
             >
-              <Field label="Target profit %" type="number" min={0} step="any" value={riskModal.targetProfitPercent} onChange={(v) => setRiskModal({ ...riskModal, targetProfitPercent: Number(v) })} />
+              <div className="space-y-4">
+                <label className="block text-sm text-slate-200">Target type
+                  <select aria-label="Target type" className="input mt-1" value={riskModal.targetMode} onChange={(e) => setRiskModal({ ...riskModal, targetMode: e.target.value as TargetMode })}>
+                    <option value="percent">Percent above average buy</option>
+                    <option value="price">Fixed target price</option>
+                  </select>
+                </label>
+                {riskModal.targetMode === "percent"
+                  ? <Field label="Target increase %" type="number" min={0} step="any" value={riskModal.targetProfitPercent} onChange={(v) => setRiskModal({ ...riskModal, targetProfitPercent: Number(v) })} />
+                  : <Field label="Target price" type="number" min={0} step="any" value={riskModal.targetPrice} onChange={(v) => setRiskModal({ ...riskModal, targetPrice: Number(v) })} />}
+              </div>
             </TogglePanel>
 
             <label className="block text-sm text-slate-200">Stock notes<textarea className="input mt-1 min-h-20" value={riskModal.notes} onChange={(e) => setRiskModal({ ...riskModal, notes: e.target.value })} placeholder="Optional stock notes" /></label>
@@ -489,141 +526,13 @@ export function PortfolioDashboard() {
           </form>
         </Modal>
       ) : null}
-    </main>
-  );
-}
-
-function StockCard({
-  card,
-  expandedTransactions,
-  onToggleTransactions,
-  onAddTransaction,
-  onPlanPurchase,
-  onEditRisk,
-  onDeleteHolding,
-  onDeleteTransaction,
-}: {
-  card: HoldingCardView;
-  expandedTransactions: boolean;
-  onToggleTransactions: () => void;
-  onAddTransaction: (bucket: BucketType) => void;
-  onPlanPurchase: (bucket: BucketType) => void;
-  onEditRisk: (bucket: BucketType) => void;
-  onDeleteHolding: () => void;
-  onDeleteTransaction: (id: string) => void;
-}) {
-  return (
-    <article className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <div className="flex items-center gap-3">
-            <h3 className="text-2xl font-bold text-white">{card.holding.symbol}</h3>
-            <PriceCell quote={card.quote} />
-          </div>
-          <div className="mt-2 grid gap-2 text-sm sm:grid-cols-3">
-            <MiniMetric label="Value" value={currency(card.totals.value)} />
-            <MiniMetric label="Cost" value={currency(card.totals.costBasis)} />
-            <MiniMetric label="P&L" value={<GainText amount={card.totals.unrealizedGain} percent={card.totals.unrealizedGainPercent} />} />
-          </div>
-          {card.holding.notes ? <p className="mt-3 text-sm text-slate-300">{card.holding.notes}</p> : null}
-        </div>
-        <div className="flex flex-wrap gap-2 sm:justify-end">
-          <button className="btn-secondary" onClick={() => onAddTransaction("short_term")}>Add buy</button>
-          <button className="btn-secondary" onClick={onToggleTransactions}>{expandedTransactions ? "Hide tx" : "Transactions"}</button>
-          <button className="rounded-xl border border-rose-400/20 bg-rose-400/10 px-3 py-2 text-sm font-semibold text-rose-100 transition hover:bg-rose-400/20" onClick={onDeleteHolding}>Delete</button>
-        </div>
-      </div>
-
-      <div className="mt-4 grid gap-3 lg:grid-cols-2">
-        <BucketSummary row={card.longTerm} onAddTransaction={() => onAddTransaction("long_term")} onPlanPurchase={() => onPlanPurchase("long_term")} onEditRisk={() => onEditRisk("long_term")} />
-        <BucketSummary row={card.shortTerm} onAddTransaction={() => onAddTransaction("short_term")} onPlanPurchase={() => onPlanPurchase("short_term")} onEditRisk={() => onEditRisk("short_term")} />
-      </div>
-
-      {expandedTransactions ? (
-        <div className="mt-4 border-t border-white/10 pt-4">
-          <h4 className="font-semibold text-white">Transactions</h4>
-          {card.transactions.length === 0 ? <p className="mt-2 text-sm text-slate-400">No transactions for this stock yet.</p> : (
-            <div className="mt-3 grid gap-2">
-              {card.transactions.map((transaction) => (
-                <div key={transaction.id} className="flex flex-col gap-2 rounded-xl bg-slate-950/50 p-3 text-sm sm:flex-row sm:items-center sm:justify-between">
-                  <div>
-                    <span className="font-semibold text-white">{bucketLabel(transaction.bucket)}</span>
-                    <span className="text-slate-400"> · {transaction.tradeDate} · {numberFmt(transaction.quantity)} shares @ {currency(transaction.buyPrice)} · Cost {currency(transaction.quantity * transaction.buyPrice)}</span>
-                    {transaction.notes ? <div className="text-slate-300">{transaction.notes}</div> : null}
-                  </div>
-                  <button className="self-start text-rose-300 hover:text-rose-100 sm:self-auto" onClick={() => onDeleteTransaction(transaction.id)}>Delete</button>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      ) : null}
-    </article>
-  );
-}
-
-function BucketSummary({ row, onAddTransaction, onPlanPurchase, onEditRisk }: { row: HoldingBucketRow; onAddTransaction: () => void; onPlanPurchase: () => void; onEditRisk: () => void }) {
-  return (
-    <section className="rounded-2xl border border-white/10 bg-slate-950/50 p-4">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h4 className="font-semibold text-white">{row.bucketLabel}</h4>
-          <p className="text-xs text-slate-400">{row.transactionCount} transaction{row.transactionCount === 1 ? "" : "s"}</p>
-        </div>
-        <div className="flex flex-col items-end gap-2">
-          <StatusBadge status={row.status} />
-          {row.targetReached ? <span className="rounded-full border border-fuchsia-400/30 bg-fuchsia-400/15 px-2.5 py-1 text-xs font-semibold text-fuchsia-200">Target hit</span> : null}
-        </div>
-      </div>
-
-      <div className="mt-4 grid grid-cols-2 gap-2 text-sm">
-        <MiniMetric label="Qty" value={numberFmt(row.quantity)} />
-        <MiniMetric label="Avg buy" value={currency(row.averageBuyPrice)} />
-        <MiniMetric label="Value" value={currency(row.currentValue)} />
-        <MiniMetric label="P&L" value={<GainText amount={row.unrealizedGain} percent={row.unrealizedGainPercent} />} />
-      </div>
-
-      <div className="mt-3 space-y-2 rounded-xl bg-white/[0.03] p-3 text-sm">
-        <div className="flex justify-between gap-3"><span className="text-slate-400">Risk</span><span className="text-right font-medium text-slate-100">{riskSummary(row)}</span></div>
-        <div className="flex justify-between gap-3"><span className="text-slate-400">Target</span><span className="text-right font-medium text-slate-100">{targetSummary(row)}</span></div>
-      </div>
-
-      <div className="mt-4 flex flex-wrap gap-2">
-        <button className="rounded-xl bg-cyan-300 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-200" onClick={onAddTransaction}>Add {row.bucket === "long_term" ? "LT" : "ST"} buy</button>
-        <button className="btn-secondary text-sm" onClick={onPlanPurchase}>Plan</button>
-        <button className="btn-secondary text-sm" onClick={onEditRisk}>Risk / target</button>
-      </div>
-    </section>
-  );
-}
-
-function EmptyState({ onAdd }: { onAdd: () => void }) {
-  return (
-    <div className="rounded-2xl border border-dashed border-white/15 bg-white/[0.03] p-10 text-center">
-      <h3 className="text-xl font-semibold text-white">No holdings yet</h3>
-      <p className="mx-auto mt-2 max-w-lg text-slate-300">Start by adding a transaction. The app will create the stock record, classify it as long-term or short-term, and calculate quantity, average buy price, P&L, and risk status.</p>
-      <button className="btn-primary mt-5" onClick={onAdd}>+ Add your first transaction</button>
-    </div>
-  );
-}
-
-function Modal({ title, children, onClose }: { title: string; children: React.ReactNode; onClose: () => void }) {
-  return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-950/80 px-4 py-8 backdrop-blur-sm">
-      <div className="w-full max-w-xl rounded-2xl border border-white/10 bg-slate-950 p-5 shadow-2xl shadow-black/40">
-        <div className="mb-4 flex items-center justify-between gap-4">
-          <h2 className="text-xl font-semibold text-white">{title}</h2>
-          <button className="rounded-lg px-2 py-1 text-slate-300 hover:bg-white/10 hover:text-white" onClick={onClose} aria-label="Close">✕</button>
-        </div>
-        {children}
-      </div>
     </div>
   );
 }
 
 function TogglePanel({ label, description, checked, onChange, children }: { label: string; description: string; checked: boolean; onChange: (checked: boolean) => void; children: React.ReactNode }) {
   return (
-    <section className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+    <section className="form-panel">
       <label className="flex cursor-pointer items-start gap-3">
         <input className="mt-1" type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
         <span><span className="block font-semibold text-white">{label}</span><span className="block text-sm text-slate-400">{description}</span></span>
@@ -640,7 +549,7 @@ function PlanResults({ plan }: { plan: PlanModalState }) {
   const impliedRisk = plannedCapital !== undefined ? plannedCapital * (plan.riskPercent / 100) : undefined;
   const validation = validatePlan(plan);
   return (
-    <section className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
+    <section className="form-panel">
       <div className="mb-3 flex items-center justify-between gap-3">
         <h3 className="font-semibold text-white">Planning result</h3>
         {plan.quote?.fetchedAt ? <span className="text-xs text-slate-400">Quote {new Date(plan.quote.fetchedAt).toLocaleTimeString()}</span> : null}
@@ -657,50 +566,8 @@ function PlanResults({ plan }: { plan: PlanModalState }) {
   );
 }
 
-function SummaryCard({ label, value, danger = false, good = false }: { label: string; value: string; danger?: boolean; good?: boolean }) {
-  const cls = danger ? "border-rose-400/30 bg-rose-400/10" : good ? "border-emerald-400/30 bg-emerald-400/10" : "border-white/10 bg-white/5";
-  return <div className={"rounded-2xl border p-4 " + cls}><p className="text-xs uppercase tracking-wider text-slate-400">{label}</p><p className="mt-2 text-2xl font-bold text-white">{value}</p></div>;
-}
-
-function MiniMetric({ label, value }: { label: string; value: React.ReactNode }) {
-  return <div className="rounded-xl bg-slate-950/50 p-3"><div className="text-xs uppercase tracking-wide text-slate-500">{label}</div><div className="mt-1 break-words font-semibold text-slate-100">{value}</div></div>;
-}
-
 function Field({ label, value, onChange, placeholder, type = "text", min, step }: { label: string; value: string | number; onChange: (value: string) => void; placeholder?: string; type?: string; min?: number; step?: number | "any" }) {
   return <label className="block text-sm text-slate-200">{label}<input className="input mt-1" type={type} value={value} placeholder={placeholder} min={min} step={step} inputMode={type === "number" ? "decimal" : undefined} onChange={(e) => onChange(e.target.value)} /></label>;
-}
-
-function PriceCell({ quote }: { quote?: StockQuote }) {
-  return <div className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-sm font-semibold text-slate-100">{currency(quote?.currentPrice)}{quote?.fetchedAt ? <span className={"ml-2 text-xs " + (isQuoteStale(quote) ? "text-amber-300" : "text-slate-400")}>{isQuoteStale(quote) ? "Stale" : "Live"}</span> : <span className="ml-2 text-xs text-slate-500">No quote</span>}</div>;
-}
-
-function GainText({ amount, percent }: { amount?: number; percent?: number }) {
-  const color = amount === undefined ? "text-slate-100" : amount >= 0 ? "text-emerald-200" : "text-rose-200";
-  return <span className={color}>{currency(amount)} <span className="text-xs text-slate-400">({percentFmt(percent)})</span></span>;
-}
-
-function StatusBadge({ status }: { status: HoldingBucketRow["status"] }) {
-  const styles = { over_limit: "bg-rose-400/15 text-rose-200 border-rose-400/30", under_limit: "bg-emerald-400/15 text-emerald-200 border-emerald-400/30", no_position: "bg-slate-400/10 text-slate-300 border-slate-400/20", record_only: "bg-sky-400/15 text-sky-200 border-sky-400/30", incomplete: "bg-amber-400/15 text-amber-200 border-amber-400/30" };
-  const labels = { over_limit: "Over", under_limit: "Under", no_position: "No position", record_only: "Record", incomplete: "Incomplete" };
-  return <span className={"rounded-full border px-2.5 py-1 text-xs font-semibold " + styles[status]}>{labels[status]}</span>;
-}
-
-function riskSummary(row: HoldingBucketRow) {
-  if (row.status === "no_position") return "No position";
-  if (row.status === "record_only") return "Not tracked";
-  if (row.remainingCapacity === undefined) return "Needs quote";
-  if (row.remainingCapacity >= 0) return currency(row.remainingCapacity) + " capacity left";
-  return currency(Math.abs(row.remainingCapacity)) + " over limit";
-}
-
-function targetSummary(row: HoldingBucketRow) {
-  if (!row.targetProfitPercent || row.targetProfitPercent <= 0) return "No target";
-  if (row.targetSellPrice === undefined) return percentFmt(row.targetProfitPercent) + " target; needs avg buy";
-  if (row.targetReached) return "Hit at " + currency(row.targetSellPrice);
-  if (row.currentPrice === undefined) return "Target " + currency(row.targetSellPrice);
-  const remaining = row.targetSellPrice - row.currentPrice;
-  const remainingPercent = row.currentPrice > 0 ? (remaining / row.currentPrice) * 100 : undefined;
-  return currency(row.targetSellPrice) + " · " + percentFmt(remainingPercent) + " away";
 }
 
 function buildHoldingCards(holdings: Holding[], rows: HoldingBucketRow[], quotes: Record<string, StockQuote | undefined>, transactions: Transaction[]): HoldingCardView[] {
@@ -709,28 +576,34 @@ function buildHoldingCards(holdings: Holding[], rows: HoldingBucketRow[], quotes
     const shortTerm = rows.find((row) => row.holdingId === holding.id && row.bucket === "short_term");
     if (!longTerm || !shortTerm) throw new Error("Missing bucket row");
     const holdingTransactions = transactions.filter((transaction) => transaction.holdingId === holding.id);
-    const value = (longTerm.currentValue ?? 0) + (shortTerm.currentValue ?? 0);
-    const costBasis = (longTerm.costBasis ?? 0) + (shortTerm.costBasis ?? 0);
-    const unrealizedGain = (longTerm.unrealizedGain ?? 0) + (shortTerm.unrealizedGain ?? 0);
-    const unrealizedGainPercent = costBasis > 0 ? (unrealizedGain / costBasis) * 100 : undefined;
-    return { holding, quote: quotes[holding.symbol], longTerm, shortTerm, transactions: holdingTransactions, totals: { quantity: longTerm.quantity + shortTerm.quantity, value, costBasis, unrealizedGain, unrealizedGainPercent } };
+    const value = quotes[holding.symbol] ? (longTerm.currentValue ?? 0) + (shortTerm.currentValue ?? 0) : longTerm.quantity + shortTerm.quantity === 0 ? 0 : undefined;
+    const costBasis = sumWhenKnown(longTerm.costBasis, shortTerm.costBasis);
+    const unrealizedGain = sumWhenKnown(longTerm.unrealizedGain, shortTerm.unrealizedGain);
+    const realizedGain = sumWhenKnown(longTerm.realizedGain, shortTerm.realizedGain);
+    const unrealizedGainPercent = costBasis !== undefined && unrealizedGain !== undefined && costBasis > 0 ? (unrealizedGain / costBasis) * 100 : undefined;
+    return { holding, quote: quotes[holding.symbol], longTerm, shortTerm, transactions: holdingTransactions, totals: { quantity: longTerm.quantity + shortTerm.quantity, value, costBasis, unrealizedGain, unrealizedGainPercent, realizedGain } };
   });
 }
 
 function buildSummary(rows: HoldingBucketRow[]) {
-  return rows.reduce((acc, row) => {
+  const summary = rows.reduce((acc, row) => {
     acc.totalValue += row.currentValue ?? 0;
     acc.totalCostBasis += row.costBasis ?? 0;
     acc.totalUnrealizedGain += row.unrealizedGain ?? 0;
+    acc.totalRealizedGain += row.realizedGain ?? 0;
+    if (row.realizedGain === undefined) acc.realizedGainKnown = false;
     if (row.status === "over_limit") acc.overLimitCount += 1;
     if (row.targetReached) acc.targetReachedCount += 1;
     if (row.quoteFetchedAt && (!acc.lastRefreshAt || row.quoteFetchedAt > acc.lastRefreshAt)) acc.lastRefreshAt = row.quoteFetchedAt;
     return acc;
-  }, { totalValue: 0, totalCostBasis: 0, totalUnrealizedGain: 0, overLimitCount: 0, targetReachedCount: 0, lastRefreshAt: "" });
+  }, { totalValue: 0, totalCostBasis: 0, totalUnrealizedGain: 0, totalRealizedGain: 0, realizedGainKnown: true, overLimitCount: 0, targetReachedCount: 0, lastRefreshAt: "" });
+  const missingQuote = rows.some((row) => row.quantity > 0 && row.currentPrice === undefined);
+  const missingCost = rows.some((row) => row.quantity > 0 && row.costBasis === undefined);
+  return { ...summary, totalValue: missingQuote ? undefined : summary.totalValue, totalCostBasis: missingCost ? undefined : summary.totalCostBasis, totalUnrealizedGain: missingQuote || missingCost ? undefined : summary.totalUnrealizedGain, totalRealizedGain: summary.realizedGainKnown ? summary.totalRealizedGain : undefined };
 }
 
-function isQuoteStale(quote: StockQuote) {
-  return Date.now() - new Date(quote.fetchedAt).getTime() > 2 * 60 * 1000;
+function sumWhenKnown(left: number | undefined, right: number | undefined): number | undefined {
+  return left === undefined || right === undefined ? undefined : left + right;
 }
 
 function bucketLabel(bucket: BucketType) {
@@ -740,8 +613,9 @@ function bucketLabel(bucket: BucketType) {
 function validateRiskModal(input: RiskModalState): string | null {
   if (input.riskEnabled && input.maxRiskAmount <= 0) return "Max risk amount must be greater than zero when risk tracking is enabled.";
   if (input.riskEnabled && input.riskPercent <= 0) return "Risk percent must be greater than zero when risk tracking is enabled.";
-  if (input.targetEnabled && input.targetProfitPercent <= 0) return "Target profit percent must be greater than zero when target profit is enabled.";
-  if (input.maxRiskAmount < 0 || input.riskPercent < 0 || input.targetProfitPercent < 0) return "Risk and target values cannot be negative.";
+  if (input.targetEnabled && input.targetMode === "percent" && (!Number.isFinite(input.targetProfitPercent) || input.targetProfitPercent <= 0)) return "Target increase percent must be a finite number greater than zero.";
+  if (input.targetEnabled && input.targetMode === "price" && (!Number.isFinite(input.targetPrice) || input.targetPrice <= 0)) return "Target price must be a finite number greater than zero.";
+  if (input.maxRiskAmount < 0 || input.riskPercent < 0 || input.targetProfitPercent < 0 || input.targetPrice < 0) return "Risk and target values cannot be negative.";
   return null;
 }
 
@@ -749,7 +623,7 @@ function validateTransaction(input: TransactionInput): string | null {
   const symbol = input.symbol.trim().toUpperCase();
   if (!/^[A-Z.\-]{1,10}$/.test(symbol)) return "Enter a valid US ticker symbol for the transaction.";
   if (input.quantity <= 0) return "Transaction quantity must be greater than zero.";
-  if (input.buyPrice <= 0) return "Buy price must be greater than zero.";
+  if (input.price <= 0) return `${input.type === "sell" ? "Sell" : "Buy"} price must be greater than zero.`;
   if (!input.tradeDate) return "Trade date is required.";
   return null;
 }

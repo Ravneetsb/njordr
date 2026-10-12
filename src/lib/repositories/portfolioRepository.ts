@@ -1,7 +1,10 @@
 "use client";
 
 import { db, DEFAULT_SETTINGS } from "@/lib/db";
-import type { AppSettings, CachedQuote, BucketType, Holding, HoldingInput, PortfolioBackup, StockQuote, Transaction, TransactionInput } from "@/lib/types";
+import { analyzeBucketTransactions, signedQuantity } from "@/lib/tradeAccounting";
+import type { AppSettings, CachedQuote, BucketType, Holding, HoldingInput, PortfolioBackup, StockQuote, TargetMode, Transaction, TransactionInput, TransactionType } from "@/lib/types";
+
+type StoredTransaction = Omit<Transaction, "type" | "price"> & { type?: TransactionType; price?: number; buyPrice?: number };
 
 export interface PortfolioRepository {
   getHoldings(): Promise<Holding[]>;
@@ -47,7 +50,7 @@ export class DexiePortfolioRepository implements PortfolioRepository {
   }
 
   async getTransactions(): Promise<Transaction[]> {
-    return (await db.transactions.orderBy("tradeDate").reverse().toArray()).map(normalizeTransaction);
+    return (await db.transactions.orderBy("tradeDate").reverse().toArray()).map((transaction) => normalizeTransaction(transaction));
   }
 
   async createTransaction(input: TransactionInput): Promise<Transaction> {
@@ -57,23 +60,38 @@ export class DexiePortfolioRepository implements PortfolioRepository {
     await db.transaction("rw", db.holdings, db.transactions, async () => {
       let holding = await db.holdings.where("symbol").equals(normalized.symbol).first();
       if (!holding) {
+        if (normalized.type === "sell") throw new Error("Cannot sell a stock that is not in the portfolio.");
         holding = blankHolding(normalized.symbol, now);
         await db.holdings.add(holding);
       }
+      holding = normalizeHolding(holding);
       created = { ...normalized, id: crypto.randomUUID(), holdingId: holding.id, createdAt: now, updatedAt: now };
+      const existingTransactions = (await db.transactions.where("holdingId").equals(holding.id).toArray()).map((transaction) => normalizeTransaction(transaction));
+      const quantityDelta = signedQuantity(created);
+      const updatedHolding = addQuantityToHolding(holding, normalized.bucket, quantityDelta, now);
+      assertValidHistory(updatedHolding, [...existingTransactions, created], normalized.bucket);
       await db.transactions.add(created);
-      await db.holdings.put(addQuantityToHolding(normalizeHolding(holding), normalized.bucket, normalized.quantity, now));
+      await db.holdings.put(updatedHolding);
     });
     return created;
   }
 
   async deleteTransaction(id: string): Promise<void> {
     await db.transaction("rw", db.holdings, db.transactions, async () => {
-      const existing = await db.transactions.get(id);
+      const stored = await db.transactions.get(id);
+      const existing = stored ? normalizeTransaction(stored) : undefined;
       if (!existing) return;
-      const holding = await db.holdings.get(existing.holdingId);
+      const storedHolding = await db.holdings.get(existing.holdingId);
+      const holding = storedHolding ? normalizeHolding(storedHolding) : undefined;
+      if (holding) {
+        const remainingTransactions = (await db.transactions.where("holdingId").equals(holding.id).toArray())
+          .filter((transaction) => transaction.id !== id)
+          .map((transaction) => normalizeTransaction(transaction));
+        const updatedHolding = addQuantityToHolding(holding, existing.bucket, -signedQuantity(existing), new Date().toISOString());
+        assertValidHistory(updatedHolding, remainingTransactions, existing.bucket);
+        await db.holdings.put(updatedHolding);
+      }
       await db.transactions.delete(id);
-      if (holding) await db.holdings.put(addQuantityToHolding(normalizeHolding(holding), existing.bucket, -existing.quantity, new Date().toISOString()));
     });
   }
 
@@ -99,45 +117,86 @@ export class DexiePortfolioRepository implements PortfolioRepository {
   }
 
   async exportBackup(): Promise<PortfolioBackup> {
-    return { version: 2, exportedAt: new Date().toISOString(), holdings: await this.getHoldings(), transactions: await this.getTransactions(), settings: await this.getSettings() };
+    return { version: 4, exportedAt: new Date().toISOString(), holdings: await this.getHoldings(), transactions: await this.getTransactions(), settings: await this.getSettings() };
   }
 
   async importBackup(backup: PortfolioBackup): Promise<void> {
-    if (![1, 2].includes(backup.version) || !Array.isArray(backup.holdings)) throw new Error("Unsupported backup file");
+    if (![1, 2, 3, 4].includes(backup.version) || !Array.isArray(backup.holdings)) throw new Error("Unsupported backup file");
+    const holdings = backup.holdings.map(normalizeHolding);
+    const storedTransactions = backup.transactions ?? [];
+    if (backup.version >= 3 && storedTransactions.some((transaction) => !isValidStoredTransaction(transaction))) throw new Error("Backup contains an invalid transaction.");
+    const transactions = storedTransactions.map((transaction) => normalizeTransaction(transaction));
+    const holdingIds = new Set(holdings.map((holding) => holding.id));
+    if (transactions.some((transaction) => !holdingIds.has(transaction.holdingId))) throw new Error("Backup contains a transaction without a matching holding.");
+    for (const holding of holdings) {
+      const holdingTransactions = transactions.filter((transaction) => transaction.holdingId === holding.id);
+      assertValidHistory(holding, holdingTransactions, "long_term");
+      assertValidHistory(holding, holdingTransactions, "short_term");
+    }
     await db.transaction("rw", db.holdings, db.transactions, db.settings, db.quoteCache, async () => {
       await db.holdings.clear();
       await db.transactions.clear();
       await db.quoteCache.clear();
-      await db.holdings.bulkPut(backup.holdings.map(normalizeHolding));
-      if (backup.transactions?.length) await db.transactions.bulkPut(backup.transactions.map(normalizeTransaction));
+      await db.holdings.bulkPut(holdings);
+      if (transactions.length) await db.transactions.bulkPut(transactions);
       await db.settings.put({ id: "app", ...(backup.settings ?? DEFAULT_SETTINGS), refreshIntervalSeconds: 60 });
     });
   }
 }
 
 function blankHolding(symbol: string, now: string): Holding {
-  return { id: crypto.randomUUID(), symbol, notes: undefined, longTermQuantity: 0, longTermMaxRiskAmount: 0, longTermRiskPercent: 0, longTermTargetProfitPercent: 0, shortTermQuantity: 0, shortTermMaxRiskAmount: 0, shortTermRiskPercent: 0, shortTermTargetProfitPercent: 0, createdAt: now, updatedAt: now };
+  return { id: crypto.randomUUID(), symbol, notes: undefined, longTermQuantity: 0, longTermMaxRiskAmount: 0, longTermRiskPercent: 0, longTermTargetEnabled: false, longTermTargetMode: "percent", longTermTargetProfitPercent: 0, longTermTargetPrice: 0, shortTermQuantity: 0, shortTermMaxRiskAmount: 0, shortTermRiskPercent: 0, shortTermTargetEnabled: false, shortTermTargetMode: "percent", shortTermTargetProfitPercent: 0, shortTermTargetPrice: 0, createdAt: now, updatedAt: now };
 }
 
 function addQuantityToHolding(holding: Holding, bucket: BucketType, quantityDelta: number, updatedAt: string): Holding {
-  if (bucket === "long_term") return { ...holding, longTermQuantity: Math.max(0, nonNegativeNumber(holding.longTermQuantity) + quantityDelta), updatedAt };
-  return { ...holding, shortTermQuantity: Math.max(0, nonNegativeNumber(holding.shortTermQuantity) + quantityDelta), updatedAt };
+  if (bucket === "long_term") return { ...holding, longTermQuantity: nonNegativeNumber(holding.longTermQuantity) + quantityDelta, updatedAt };
+  return { ...holding, shortTermQuantity: nonNegativeNumber(holding.shortTermQuantity) + quantityDelta, updatedAt };
 }
 
 function sanitizeInput(input: HoldingInput): HoldingInput {
-  return { symbol: input.symbol.trim().toUpperCase(), notes: input.notes?.trim() || undefined, longTermQuantity: nonNegative(input.longTermQuantity), longTermMaxRiskAmount: nonNegative(input.longTermMaxRiskAmount), longTermRiskPercent: nonNegative(input.longTermRiskPercent), longTermTargetProfitPercent: nonNegative(input.longTermTargetProfitPercent ?? 0), shortTermQuantity: nonNegative(input.shortTermQuantity), shortTermMaxRiskAmount: nonNegative(input.shortTermMaxRiskAmount), shortTermRiskPercent: nonNegative(input.shortTermRiskPercent), shortTermTargetProfitPercent: nonNegative(input.shortTermTargetProfitPercent ?? 0) };
+  const longTermTargetProfitPercent = nonNegative(input.longTermTargetProfitPercent ?? 0);
+  const longTermTargetPrice = nonNegative(input.longTermTargetPrice ?? 0);
+  const shortTermTargetProfitPercent = nonNegative(input.shortTermTargetProfitPercent ?? 0);
+  const shortTermTargetPrice = nonNegative(input.shortTermTargetPrice ?? 0);
+  return { symbol: input.symbol.trim().toUpperCase(), notes: input.notes?.trim() || undefined, longTermQuantity: nonNegative(input.longTermQuantity), longTermMaxRiskAmount: nonNegative(input.longTermMaxRiskAmount), longTermRiskPercent: nonNegative(input.longTermRiskPercent), longTermTargetEnabled: input.longTermTargetEnabled ?? longTermTargetProfitPercent > 0, longTermTargetMode: targetMode(input.longTermTargetMode), longTermTargetProfitPercent, longTermTargetPrice, shortTermQuantity: nonNegative(input.shortTermQuantity), shortTermMaxRiskAmount: nonNegative(input.shortTermMaxRiskAmount), shortTermRiskPercent: nonNegative(input.shortTermRiskPercent), shortTermTargetEnabled: input.shortTermTargetEnabled ?? shortTermTargetProfitPercent > 0, shortTermTargetMode: targetMode(input.shortTermTargetMode), shortTermTargetProfitPercent, shortTermTargetPrice };
 }
 
 function sanitizeTransactionInput(input: TransactionInput): TransactionInput {
-  return { symbol: input.symbol.trim().toUpperCase(), bucket: input.bucket, quantity: nonNegative(input.quantity), buyPrice: nonNegative(input.buyPrice), tradeDate: input.tradeDate || new Date().toISOString().slice(0, 10), notes: input.notes?.trim() || undefined };
+  return { symbol: input.symbol.trim().toUpperCase(), bucket: input.bucket, type: input.type === "sell" ? "sell" : "buy", quantity: nonNegative(input.quantity), price: nonNegative(input.price), tradeDate: input.tradeDate || new Date().toISOString().slice(0, 10), notes: input.notes?.trim() || undefined };
 }
 
 function normalizeHolding(holding: Holding): Holding {
-  return { ...holding, symbol: holding.symbol.toUpperCase(), notes: holding.notes || undefined, longTermQuantity: nonNegativeNumber(holding.longTermQuantity), longTermMaxRiskAmount: nonNegativeNumber(holding.longTermMaxRiskAmount), longTermRiskPercent: nonNegativeNumber(holding.longTermRiskPercent), longTermTargetProfitPercent: nonNegativeNumber(holding.longTermTargetProfitPercent ?? 0), shortTermQuantity: nonNegativeNumber(holding.shortTermQuantity), shortTermMaxRiskAmount: nonNegativeNumber(holding.shortTermMaxRiskAmount), shortTermRiskPercent: nonNegativeNumber(holding.shortTermRiskPercent), shortTermTargetProfitPercent: nonNegativeNumber(holding.shortTermTargetProfitPercent ?? 0) };
+  const longTermTargetProfitPercent = nonNegativeNumber(holding.longTermTargetProfitPercent ?? 0);
+  const shortTermTargetProfitPercent = nonNegativeNumber(holding.shortTermTargetProfitPercent ?? 0);
+  return { ...holding, symbol: holding.symbol.toUpperCase(), notes: holding.notes || undefined, longTermQuantity: nonNegativeNumber(holding.longTermQuantity), longTermMaxRiskAmount: nonNegativeNumber(holding.longTermMaxRiskAmount), longTermRiskPercent: nonNegativeNumber(holding.longTermRiskPercent), longTermTargetEnabled: holding.longTermTargetEnabled ?? longTermTargetProfitPercent > 0, longTermTargetMode: targetMode(holding.longTermTargetMode), longTermTargetProfitPercent, longTermTargetPrice: nonNegativeNumber(holding.longTermTargetPrice ?? 0), shortTermQuantity: nonNegativeNumber(holding.shortTermQuantity), shortTermMaxRiskAmount: nonNegativeNumber(holding.shortTermMaxRiskAmount), shortTermRiskPercent: nonNegativeNumber(holding.shortTermRiskPercent), shortTermTargetEnabled: holding.shortTermTargetEnabled ?? shortTermTargetProfitPercent > 0, shortTermTargetMode: targetMode(holding.shortTermTargetMode), shortTermTargetProfitPercent, shortTermTargetPrice: nonNegativeNumber(holding.shortTermTargetPrice ?? 0) };
 }
 
-function normalizeTransaction(transaction: Transaction): Transaction {
-  return { ...transaction, symbol: transaction.symbol.toUpperCase(), notes: transaction.notes || undefined };
+function targetMode(value: TargetMode | undefined): TargetMode {
+  return value === "price" ? "price" : "percent";
+}
+
+function normalizeTransaction(transaction: Transaction | StoredTransaction): Transaction {
+  const stored = transaction as StoredTransaction;
+  const current = { ...stored };
+  delete current.buyPrice;
+  return { ...current, type: stored.type === "sell" ? "sell" : "buy", price: nonNegativeNumber(stored.price ?? stored.buyPrice), symbol: transaction.symbol.toUpperCase(), notes: transaction.notes || undefined };
+}
+
+function assertValidHistory(holding: Holding, transactions: Transaction[], bucket: BucketType): void {
+  const currentQuantity = bucket === "long_term" ? holding.longTermQuantity : holding.shortTermQuantity;
+  const accounting = analyzeBucketTransactions(transactions, bucket, currentQuantity);
+  if (accounting.invalidTransaction) {
+    const transaction = accounting.invalidTransaction;
+    throw new Error(`Cannot ${transaction.type} ${transaction.quantity} ${transaction.symbol} shares on ${transaction.tradeDate}; only ${accounting.quantity} shares are available in the ${bucket === "long_term" ? "long-term" : "short-term"} bucket.`);
+  }
+}
+
+function isValidStoredTransaction(transaction: Transaction | StoredTransaction): boolean {
+  const stored = transaction as StoredTransaction;
+  return (stored.type === "buy" || stored.type === "sell")
+    && Number.isFinite(stored.quantity) && stored.quantity > 0
+    && Number.isFinite(stored.price) && (stored.price ?? 0) > 0
+    && Boolean(stored.tradeDate);
 }
 
 function nonNegative(value: number): number {

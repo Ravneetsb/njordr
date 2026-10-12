@@ -1,4 +1,6 @@
 export type BucketType = "long_term" | "short_term";
+export type TransactionType = "buy" | "sell";
+export type TargetMode = "percent" | "price";
 export type RiskStatus = "under_limit" | "over_limit" | "no_position" | "record_only" | "incomplete";
 
 export type Holding = {
@@ -8,11 +10,17 @@ export type Holding = {
   longTermQuantity: number;
   longTermMaxRiskAmount: number;
   longTermRiskPercent: number;
+  longTermTargetEnabled?: boolean;
+  longTermTargetMode?: TargetMode;
   longTermTargetProfitPercent?: number;
+  longTermTargetPrice?: number;
   shortTermQuantity: number;
   shortTermMaxRiskAmount: number;
   shortTermRiskPercent: number;
+  shortTermTargetEnabled?: boolean;
+  shortTermTargetMode?: TargetMode;
   shortTermTargetProfitPercent?: number;
+  shortTermTargetPrice?: number;
   createdAt: string;
   updatedAt: string;
 };
@@ -24,8 +32,9 @@ export type Transaction = {
   holdingId: string;
   symbol: string;
   bucket: BucketType;
+  type: TransactionType;
   quantity: number;
-  buyPrice: number;
+  price: number;
   tradeDate: string;
   notes?: string;
   createdAt: string;
@@ -68,8 +77,13 @@ export type HoldingBucketRow = {
   costBasis?: number;
   unrealizedGain?: number;
   unrealizedGainPercent?: number;
+  realizedGain?: number;
+  realizedGainByTransactionId: Record<string, number | undefined>;
   transactionCount: number;
+  targetEnabled: boolean;
+  targetMode: TargetMode;
   targetProfitPercent?: number;
+  targetPrice?: number;
   targetSellPrice?: number;
   targetReached?: boolean;
   maxRiskAmount: number;
@@ -85,7 +99,7 @@ export type HoldingBucketRow = {
 };
 
 export type PortfolioBackup = {
-  version: 1 | 2;
+  version: 1 | 2 | 3 | 4;
   exportedAt: string;
   holdings: Holding[];
   transactions?: Transaction[];

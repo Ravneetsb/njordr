@@ -27,6 +27,16 @@ class NjordrDatabase extends Dexie {
       settings: "id",
       quoteCache: "symbol, fetchedAt",
     });
+    this.version(3).stores({
+      holdings: "id, symbol, updatedAt",
+      transactions: "id, holdingId, symbol, bucket, tradeDate, updatedAt",
+      settings: "id",
+      quoteCache: "symbol, fetchedAt",
+    }).upgrade((transaction) => transaction.table("transactions").toCollection().modify((row) => {
+      row.type = row.type === "sell" ? "sell" : "buy";
+      row.price = row.price ?? row.buyPrice;
+      delete row.buyPrice;
+    }));
   }
 }
 

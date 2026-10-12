@@ -1,4 +1,5 @@
-import type { BucketType, Holding, HoldingBucketRow, StockQuote, Transaction } from "./types";
+import type { BucketType, Holding, HoldingBucketRow, StockQuote, TargetMode, Transaction } from "./types";
+import { analyzeBucketTransactions } from "./tradeAccounting";
 
 export function maxInvestmentValue(maxRiskAmount: number, riskPercent: number): number | undefined {
   if (maxRiskAmount <= 0 || riskPercent <= 0) return undefined;
@@ -39,7 +40,10 @@ export function buildBucketRows(holdings: Holding[], quotes: Record<string, Stoc
         holding.longTermQuantity,
         holding.longTermMaxRiskAmount,
         holding.longTermRiskPercent,
+        holding.longTermTargetEnabled ?? (holding.longTermTargetProfitPercent ?? 0) > 0,
+        holding.longTermTargetMode ?? "percent",
         holding.longTermTargetProfitPercent,
+        holding.longTermTargetPrice,
         holdingTransactions,
         quote,
       ),
@@ -50,7 +54,10 @@ export function buildBucketRows(holdings: Holding[], quotes: Record<string, Stoc
         holding.shortTermQuantity,
         holding.shortTermMaxRiskAmount,
         holding.shortTermRiskPercent,
+        holding.shortTermTargetEnabled ?? (holding.shortTermTargetProfitPercent ?? 0) > 0,
+        holding.shortTermTargetMode ?? "percent",
         holding.shortTermTargetProfitPercent,
+        holding.shortTermTargetPrice,
         holdingTransactions,
         quote,
       ),
@@ -65,17 +72,26 @@ function buildRow(
   legacyQuantity: number,
   maxRiskAmount: number,
   riskPercent: number,
+  targetEnabled: boolean,
+  targetMode: TargetMode,
   targetProfitPercent: number | undefined,
+  targetPrice: number | undefined,
   transactions: Transaction[],
   quote?: StockQuote,
 ): HoldingBucketRow {
-  const aggregate = aggregateBucket(transactions, bucket, legacyQuantity);
+  const aggregate = analyzeBucketTransactions(transactions, bucket, legacyQuantity);
   const maxValue = maxInvestmentValue(maxRiskAmount, riskPercent);
   const currentPrice = quote?.currentPrice;
   const currentValue = currentPrice === undefined ? undefined : aggregate.quantity * currentPrice;
   const unrealizedGain = currentValue !== undefined && aggregate.costBasis !== undefined ? currentValue - aggregate.costBasis : undefined;
   const unrealizedGainPercent = unrealizedGain !== undefined && aggregate.costBasis && aggregate.costBasis > 0 ? (unrealizedGain / aggregate.costBasis) * 100 : undefined;
-  const targetSellPrice = targetProfitPercent && targetProfitPercent > 0 && aggregate.averageBuyPrice !== undefined ? aggregate.averageBuyPrice * (1 + targetProfitPercent / 100) : undefined;
+  const targetSellPrice = !targetEnabled
+    ? undefined
+    : targetMode === "price"
+      ? positive(targetPrice)
+      : positive(targetProfitPercent) !== undefined && aggregate.averageBuyPrice !== undefined
+        ? aggregate.averageBuyPrice * (1 + (targetProfitPercent ?? 0) / 100)
+        : undefined;
   const targetReached = targetSellPrice !== undefined && currentPrice !== undefined ? currentPrice >= targetSellPrice : undefined;
   const isRiskTracked = maxValue !== undefined;
   const maxSuggestedShares = isRiskTracked && currentPrice && currentPrice > 0 ? Math.floor(maxValue / currentPrice) : undefined;
@@ -93,8 +109,13 @@ function buildRow(
     costBasis: aggregate.costBasis,
     unrealizedGain,
     unrealizedGainPercent,
+    realizedGain: aggregate.realizedGain,
+    realizedGainByTransactionId: aggregate.realizedGainByTransactionId,
     transactionCount: aggregate.transactionCount,
+    targetEnabled,
+    targetMode,
     targetProfitPercent,
+    targetPrice,
     targetSellPrice,
     targetReached,
     maxRiskAmount,
@@ -110,22 +131,6 @@ function buildRow(
   };
 }
 
-function aggregateBucket(transactions: Transaction[], bucket: BucketType, legacyQuantity: number) {
-  const bucketTransactions = transactions.filter((transaction) => transaction.bucket === bucket);
-  if (bucketTransactions.length === 0) {
-    return { quantity: legacyQuantity ?? 0, averageBuyPrice: undefined, costBasis: undefined, transactionCount: 0 };
-  }
-
-  const quantity = sum(bucketTransactions, (transaction) => transaction.quantity);
-  const costBasis = sum(bucketTransactions, (transaction) => transaction.quantity * transaction.buyPrice);
-  return {
-    quantity,
-    averageBuyPrice: quantity > 0 ? costBasis / quantity : undefined,
-    costBasis,
-    transactionCount: bucketTransactions.length,
-  };
-}
-
-function sum<T>(items: T[], selector: (item: T) => number): number {
-  return items.reduce((total, item) => total + selector(item), 0);
+function positive(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isFinite(value) && value > 0 ? value : undefined;
 }
